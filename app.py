@@ -10,32 +10,42 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from garmin_personal_api import GarminPersonalApiClient, HttpError, PersonalApiAuthenticator
+import anyio.to_thread
+from garmin_personal_api import BearerToken, GarminPersonalApiClient, HttpError, PersonalApiAuthenticator
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from starlette.datastructures import Headers
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 mcp = MCPServer(
     "garmin",
     instructions="Read-only access to the user's Garmin Connect health and activity data. Dates are YYYY-MM-DD.",
 )
 
-@contextmanager
-def garmin(ctx: Context) -> Iterator[GarminPersonalApiClient]:
-    headers = ctx.headers or {}
-    authorization = headers.get("authorization", "")
-    if not authorization.startswith("Bearer "):
-        raise ToolError(
-            "Missing Garmin Personal API key. Configure the connector with the header "
-            "`Authorization: Bearer <your Garmin Personal API key>`."
-        )
-    api_key = authorization.removeprefix("Bearer ").strip()
+def api_key_from(authorization: str | None) -> str | None:
+    if authorization is None or not authorization.startswith("Bearer "):
+        return None
+    return authorization.removeprefix("Bearer ").strip() or None
+
+
+def obtain_token(api_key: str) -> BearerToken:
     # The library's cache file holds a single token, so give each key its own file; Fluid
     # instances serve many requests and would otherwise thrash it. /tmp is Vercel's only writable path.
     key_hash = hashlib.sha256(api_key.encode()).hexdigest()
     cache_file = f"/tmp/garmin-tokens/{key_hash}.json"
+    with PersonalApiAuthenticator(bearer_token_cache_file=cache_file) as authenticator:
+        return authenticator.obtain_token(api_key)
+
+
+@contextmanager
+def garmin(ctx: Context) -> Iterator[GarminPersonalApiClient]:
+    headers = ctx.headers or {}
+    api_key = api_key_from(headers.get("authorization"))
+    if api_key is None:
+        raise RuntimeError("require_garmin_key should have rejected a request without a key")
     try:
-        with PersonalApiAuthenticator(bearer_token_cache_file=cache_file) as authenticator:
-            token = authenticator.obtain_token(api_key)
+        token = obtain_token(api_key)
     except HttpError as error:
         raise ToolError(
             f"Garmin rejected the API key (HTTP {error.status_code}). It may be wrong, expired or deleted."
@@ -142,5 +152,39 @@ def activity(activity_id: int, ctx: Context) -> Any:
         return client.get_activity(activity_id)
 
 
+def unauthorized(message: str) -> JSONResponse:
+    return JSONResponse(
+        {"error": "unauthorized", "message": message},
+        status_code=401,
+        headers={"WWW-Authenticate": 'Bearer realm="garmin-mcp"'},
+    )
+
+
+def require_garmin_key(app: ASGIApp) -> ASGIApp:
+    """Reject any HTTP request that doesn't carry a Garmin key Garmin accepts, before it reaches MCP."""
+
+    async def guarded(scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await app(scope, receive, send)
+            return
+        api_key = api_key_from(Headers(scope=scope).get("authorization"))
+        if api_key is None:
+            response = unauthorized("Send your Garmin Personal API key as `Authorization: Bearer <key>`.")
+            await response(scope, receive, send)
+            return
+        try:
+            await anyio.to_thread.run_sync(obtain_token, api_key)
+        except HttpError as error:
+            if error.status_code not in (400, 401, 403):
+                raise
+            response = unauthorized("Garmin rejected the API key. It may be wrong, expired or deleted.")
+            await response(scope, receive, send)
+            return
+        await app(scope, receive, send)
+
+    return guarded
+
+
 # Serving on 0.0.0.0 turns off the SDK's localhost-only DNS-rebinding guard, which would reject the public host.
-app = mcp.streamable_http_app(stateless_http=True, json_response=True, host="0.0.0.0")
+mcp_app = mcp.streamable_http_app(stateless_http=True, json_response=True, host="0.0.0.0")
+app = require_garmin_key(mcp_app)

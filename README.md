@@ -2,7 +2,7 @@
 
 A remote MCP server for your own Garmin Connect data, for Claude and ChatGPT on web, desktop and mobile. Read-only.
 
-The server holds no secrets. Each client sends your Garmin Personal API key as `Authorization: Bearer <key>`; the server exchanges it for a 24-hour Garmin access token and reads your data with Garmin's official [`garmin-connect-personal-api-python`](https://github.com/garmin/connect-personal-api-python) client.
+The server holds no secrets. Every request must carry a key Garmin accepts, or it gets a `401` before reaching MCP. Each client sends your Garmin Personal API key as `Authorization: Bearer <key>`; the server exchanges it for a 24-hour Garmin access token and reads your data with Garmin's official [`garmin-connect-personal-api-python`](https://github.com/garmin/connect-personal-api-python) client.
 
 ## Get a key
 
