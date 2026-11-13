@@ -2,9 +2,10 @@
 
 Clients authenticate by sending their Garmin Personal API key as
 `Authorization: Bearer <key>`. The server stores no secrets: it exchanges the
-key for a 24h Garmin access token per request (cached in /tmp) and reads data.
+key for a 24h Garmin access token (cached per key in /tmp) and reads data.
 """
 
+import hashlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -18,10 +19,6 @@ mcp = MCPServer(
     instructions="Read-only access to the user's Garmin Connect health and activity data. Dates are YYYY-MM-DD.",
 )
 
-# /tmp is the only writable path on Vercel; the cache is keyed by a hash of the API key.
-authenticator = PersonalApiAuthenticator(bearer_token_cache_file="/tmp/garmin-bearer-token.json")
-
-
 @contextmanager
 def garmin(ctx: Context) -> Iterator[GarminPersonalApiClient]:
     headers = ctx.headers or {}
@@ -32,8 +29,13 @@ def garmin(ctx: Context) -> Iterator[GarminPersonalApiClient]:
             "`Authorization: Bearer <your Garmin Personal API key>`."
         )
     api_key = authorization.removeprefix("Bearer ").strip()
+    # The library's cache file holds a single token, so give each key its own file; Fluid
+    # instances serve many requests and would otherwise thrash it. /tmp is Vercel's only writable path.
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+    cache_file = f"/tmp/garmin-tokens/{key_hash}.json"
     try:
-        token = authenticator.obtain_token(api_key)
+        with PersonalApiAuthenticator(bearer_token_cache_file=cache_file) as authenticator:
+            token = authenticator.obtain_token(api_key)
     except HttpError as error:
         raise ToolError(
             f"Garmin rejected the API key (HTTP {error.status_code}). It may be wrong, expired or deleted."
