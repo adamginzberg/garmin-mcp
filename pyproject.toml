@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "anyio>=4.16.0",
     "garmin-connect-personal-api-python>=1.0.0",
+    "garmin-fit-sdk>=21.221.0",
     "mcp>=2.3.0",
     "starlette>=1.10.0",
 ]
